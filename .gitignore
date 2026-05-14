@@ -34,3 +34,7 @@ extracted_data/*
 # Cache
 .cache/
 *.cache
+
+# Large resume files - these will be added separately
+Unical Resumes/*.pdf
+Unical Resumes/*.docx
