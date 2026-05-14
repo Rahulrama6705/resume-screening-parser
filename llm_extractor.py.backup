@@ -1,0 +1,239 @@
+import json
+import requests
+import re
+from typing import Dict, Optional
+
+
+class OllamaExtractor:
+    def __init__(self, model="phi3:mini", base_url="http://localhost:11434"):
+        self.model = model
+        self.base_url = base_url
+    
+    def extract_fields(self, resume_text: str) -> Dict:
+        """Extract structured fields from resume using Ollama."""
+        
+        trimmed_text = resume_text[:1500]  # Optimal length for speed
+        
+        prompt = f"""Extract candidate information from this resume. Return ONLY data that is explicitly written.
+
+Resume:
+{trimmed_text}
+
+Extract these fields EXACTLY as they appear:
+1. name - Full name of candidate
+2. email - Email address
+3. phone - Phone number
+4. skills - List of all technical skills, programming languages, tools mentioned
+5. experience - Work experience summary
+6. education - Education and degrees
+7. company - Current or recent company
+8. certifications - Certifications and credentials
+
+RULES:
+- Do NOT invent or assume any information
+- Return empty string "" if field is not mentioned
+- For skills: Return as array of strings, one skill per item
+- Extract exactly what is written, no more, no less
+
+Return valid JSON ONLY:
+{{"name":"","email":"","phone":"","skills":[],"experience":"","education":"","company":"","certifications":[]}}"""
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "temperature": 0.1
+                },
+                timeout=120
+            )
+            
+            if response.status_code != 200:
+                print(f"Ollama error: {response.status_code}")
+                return self._empty_result()
+            
+            result = response.json()
+            response_text = result.get("response", "")
+            
+            # Extract JSON from response
+            json_data = self._extract_json(response_text)
+            
+            if json_data:
+                # Validate extracted data
+                json_data = self._validate_and_clean(json_data, trimmed_text)
+                return json_data
+            else:
+                return self._empty_result()
+                
+        except requests.exceptions.Timeout:
+            return self._fast_extract(trimmed_text)
+        except requests.exceptions.ConnectionError:
+            return self._empty_result()
+        except Exception as e:
+            return self._empty_result()
+    
+    def _extract_json(self, text: str) -> Optional[Dict]:
+        """Extract JSON object from text."""
+        # Try to find JSON block
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        
+        if json_match:
+            try:
+                json_str = json_match.group(0)
+                data = json.loads(json_str)
+                return data
+            except json.JSONDecodeError:
+                pass
+        
+        return None
+    
+    def _fast_extract(self, text: str) -> Dict:
+        """Fast regex-based extraction - simpler and faster."""
+        result = self._empty_result()
+        
+        # NAME - simple pattern
+        name_match = re.search(r'^([A-Z][a-zA-Z\s]{2,40})$', text, re.MULTILINE)
+        if name_match:
+            result['name'] = name_match.group(1).strip()
+        
+        # EMAIL - find all and use first
+        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+        if emails:
+            result['email'] = emails[0]
+        
+        # PHONE - common patterns
+        phones = re.findall(r'(?:\+91|0)?[6789]\d{9}|(?:\+\d{1,3})[\s]?\d{5,14}', text)
+        if phones:
+            result['phone'] = phones[0]
+        
+        # SKILLS - focused list of common technologies
+        common_skills = {
+            'Python', 'Java', 'JavaScript', 'C++', 'C#', 'SQL', 'React', 'Angular', 
+            'Node.js', 'Django', 'Spring', 'AWS', 'Azure', 'Docker', 'Kubernetes',
+            'MongoDB', 'PostgreSQL', 'MySQL', 'Git', 'Linux', 'AWS', 'HTML', 'CSS',
+            'TypeScript', 'Vue', 'Express', 'Flask', 'FastAPI', 'GraphQL', 'REST',
+            'Agile', 'Scrum', 'Salesforce', 'Tableau', 'Power BI', 'Machine Learning'
+        }
+        
+        found_skills = []
+        for skill in common_skills:
+            if re.search(r'\b' + re.escape(skill) + r'\b', text, re.IGNORECASE):
+                found_skills.append(skill)
+        result['skills'] = found_skills
+        
+        # EXPERIENCE - look for job-related keywords
+        if 'experience' in text.lower() or 'work' in text.lower():
+            exp_match = re.search(r'(experience|work|employment|career)[\s\n]+(.*?)(?=education|projects|skills|certification|$)', 
+                                text, re.IGNORECASE | re.DOTALL)
+            if exp_match:
+                result['experience'] = exp_match.group(2).strip()[:250]
+        
+        # EDUCATION - look for degree keywords
+        if 'degree' in text.lower() or 'education' in text.lower() or 'bachelor' in text.lower():
+            edu_match = re.search(r'(education|degree|bachelor|master|phd|b\.?tech|m\.?tech)[\s\n]+(.*?)(?=experience|skills|projects|$)',
+                                text, re.IGNORECASE | re.DOTALL)
+            if edu_match:
+                result['education'] = edu_match.group(2).strip()[:250]
+        
+        # COMPANY - look for company name patterns
+        company_match = re.search(r'(?:company|employer|working at|at)[\s:]+([A-Za-z0-9\s&,\.]{2,50})', text, re.IGNORECASE)
+        if company_match:
+            result['company'] = company_match.group(1).strip()
+        
+        return result
+    
+    def _validate_and_clean(self, extracted_data: Dict, resume_text: str) -> Dict:
+        """Light validation - only format checks, no strict requirements."""
+        result = extracted_data.copy()
+        
+        # EMAIL: Format validation only
+        email = result.get('email', '').strip()
+        if email and '@' not in email:
+            result['email'] = ""
+        
+        # PHONE: Format validation only
+        phone = result.get('phone', '').strip()
+        if phone:
+            phone_clean = re.sub(r'\s+', '', phone)
+            if not re.match(r'^[\d+\-\(\)]{7,}$', phone_clean):
+                result['phone'] = ""
+        
+        # SKILLS: Keep all, only remove obvious nonsense
+        skills = result.get('skills', [])
+        if skills:
+            cleaned = []
+            for skill in skills:
+                if isinstance(skill, str) and 2 <= len(skill) <= 100:
+                    cleaned.append(skill)
+            result['skills'] = cleaned
+        
+        return result
+    
+    def _empty_result(self) -> Dict:
+        """Return empty result structure."""
+        return {
+            "name": "",
+            "email": "",
+            "phone": "",
+            "dob": "",
+            "skills": [],
+            "experience": "",
+            "education": "",
+            "gpa": "",
+            "certifications": [],
+            "projects": [],
+            "linkedin": "",
+            "github": "",
+            "company": "",
+            "category": ""
+        }
+    
+    def generate_analysis(self, extracted_data: Dict) -> str:
+        """Generate AI analysis of candidate."""
+        
+        # Always generate analysis - even with minimal data
+        name = extracted_data.get('name', 'Candidate').strip()
+        skills = extracted_data.get('skills', [])
+        experience = extracted_data.get('experience', '').strip()
+        
+        # Build prompt with whatever we have
+        prompt = f"""Generate a brief professional summary (2-3 sentences) for this candidate:
+
+Name: {name if name else 'Unknown'}
+Skills: {', '.join(str(s) for s in skills[:8]) if skills else 'Not specified'}
+Experience: {experience if experience else 'Not specified'}
+
+Be factual and professional. If data is missing, note that."""
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "temperature": 0.3
+                },
+                timeout=90
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                analysis = result.get("response", "").strip()
+                if analysis and len(analysis) < 600:
+                    return analysis
+                elif analysis:
+                    return analysis[:500] + "..."
+            
+        except Exception as e:
+            pass
+        
+        # Fallback analysis - always provide something
+        if skills:
+            return f"{name} is a professional with expertise in {', '.join(skills[:3])}."
+        elif experience:
+            return f"{name} has professional experience and relevant background."
+        else:
+            return f"{name} - candidate profile available for review."
